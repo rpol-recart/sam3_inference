@@ -1,0 +1,41 @@
+# Docker Compose for SAM3 Inference Server (Local SAM3)
+# Run from: D:\Projects\Sam_agent (project root!)
+# Command: docker-compose -f model_inference/sam3/docker-compose.local.yml up -d
+
+version: '3.8'
+
+services:
+  sam3-server:
+    build:
+      context: .
+      dockerfile: model_inference/sam3/Dockerfile.local
+    container_name: sam3-inference
+    ports:
+      - "8000:8000"
+      - "9090:9090"
+    volumes:
+      - ./model_inference/sam3/outputs:/tmp/sam3_outputs
+      - ./model_inference/sam3/uploads:/tmp/sam3_uploads
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8000
+      - IMAGE_MODEL_DEVICE=cuda:0
+      - VIDEO_MODEL_ENABLED=true
+      - VIDEO_MODEL_GPUS=0,1,2,3
+      - LOG_LEVEL=INFO
+      - SAM3_CHECKPOINT=facebook/sam3
+      - SAM3_BPE_PATH=/app/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
