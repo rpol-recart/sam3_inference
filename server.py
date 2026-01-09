@@ -19,16 +19,19 @@ logger.add(
     level=settings.log_level,
 )
 
-# Global model instances
-image_model = None
-video_model = None
-session_manager = None
+# Global model instances - commented out as they are replaced with app.state
+# image_model = None
+# video_model = None
+# session_manager = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for model loading/unloading."""
-    global image_model, video_model, session_manager
+    # Initialize state variables
+    app.state.image_model = None
+    app.state.video_model = None
+    app.state.session_manager = None
 
     # Startup: Load models
     logger.info("Starting SAM3 Inference Server...")
@@ -49,9 +52,9 @@ async def lifespan(app: FastAPI):
         try:
             from models.sam3_image import SAM3ImageModel
 
-            logger.info("Loading SAM3 image model...")
-            image_model = SAM3ImageModel(
-                checkpoint=settings.sam3_checkpoint,
+            logger.info(f"Loading SAM3 image model...{settings.sam3_checkpoint},{settings.sam3_bpe_path}")
+            app.state.image_model = SAM3ImageModel(
+                checkpoint='/app/server/sam_weights/sam3.pt',
                 bpe_path=settings.sam3_bpe_path,
                 device=settings.image_model_device,
                 confidence_threshold=settings.image_model_confidence_threshold,
@@ -70,7 +73,7 @@ async def lifespan(app: FastAPI):
             from services.session_manager import SessionManager
 
             logger.info("Loading SAM3 video model...")
-            video_model = SAM3VideoModel(
+            app.state.video_model = SAM3VideoModel(
                 checkpoint=settings.sam3_checkpoint,
                 bpe_path=settings.sam3_bpe_path,
                 gpu_ids=settings.video_gpu_list,
@@ -79,7 +82,7 @@ async def lifespan(app: FastAPI):
             )
 
             # Initialize session manager
-            session_manager = SessionManager(
+            app.state.session_manager = SessionManager(
                 max_sessions=settings.max_concurrent_sessions,
                 session_timeout_seconds=3600,
             )
@@ -98,12 +101,12 @@ async def lifespan(app: FastAPI):
 
     # Shutdown: Cleanup
     logger.info("Shutting down server...")
-    if image_model:
-        image_model.clear_cache()
-    if video_model:
-        video_model.shutdown()
-    if session_manager:
-        session_manager.clear_all_sessions()
+    if app.state.image_model:
+        app.state.image_model.clear_cache()
+    if app.state.video_model:
+        app.state.video_model.shutdown()
+    if app.state.session_manager:
+        app.state.session_manager.clear_all_sessions()
     logger.info("Server shutdown complete")
 
 
