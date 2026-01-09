@@ -11,7 +11,7 @@ from typing import Dict
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 
-# Removed import server to break circular dependency
+
 from api.schemas.video_schemas import (
     AddPromptRequest,
     AddPromptResponse,
