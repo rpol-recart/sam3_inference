@@ -18,6 +18,8 @@ RUN apt-get update && apt-get install -y \
         python3.12 \
         python3.12-venv \
         python3-pip \
+    && apt-get install -y \
+        libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Clone SAM3 repository
