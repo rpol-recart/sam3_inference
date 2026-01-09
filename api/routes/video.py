@@ -8,10 +8,10 @@ import time
 from pathlib import Path
 from typing import Dict
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 
-import server
+# Removed import server to break circular dependency
 from api.schemas.video_schemas import (
     AddPromptRequest,
     AddPromptResponse,
@@ -51,10 +51,35 @@ def _save_video_from_request(request: StartSessionRequest) -> str:
         return request.video_path
 
     if request.video_url:
-        # TODO: Download video from URL
-        raise HTTPException(
-            status_code=501, detail="Video URL download not yet implemented"
-        )
+        # Download video from URL
+        import urllib.request
+        from urllib.parse import urlparse
+        
+        try:
+            # Create temporary file to store downloaded video
+            temp_dir = Path(tempfile.gettempdir()) / "sam3_videos"
+            temp_dir.mkdir(exist_ok=True)
+            
+            # Generate a unique filename based on URL
+            url_hash = hashlib.md5(request.video_url.encode()).hexdigest()
+            parsed_url = urlparse(request.video_url)
+            ext = os.path.splitext(parsed_url.path)[1] or ".mp4"
+            temp_video_path = temp_dir / f"downloaded_{url_hash}{ext}"
+            
+            # Download the video file
+            urllib.request.urlretrieve(request.video_url, str(temp_video_path))
+            
+            # Verify that the file was downloaded
+            if not temp_video_path.exists():
+                raise HTTPException(
+                    status_code=500, detail="Failed to download video from URL"
+                )
+                
+            return str(temp_video_path)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to download video from URL: {str(e)}"
+            )
 
     if request.video_base64:
         # Decode base64 and save to temp file
@@ -83,14 +108,14 @@ def _save_video_from_request(request: StartSessionRequest) -> str:
 
 
 @router.post("/session/start", response_model=StartSessionResponse)
-async def start_video_session(request: StartSessionRequest):
+async def start_video_session(request: StartSessionRequest, req: Request):
     """
     Start a new video inference session.
 
     Creates a session for video processing. The session maintains state
     for tracking objects across frames.
     """
-    if server.video_model is None:
+    if req.app.state.video_model is None:
         raise HTTPException(
             status_code=503, detail="Video inference is not enabled on this server"
         )
@@ -100,12 +125,12 @@ async def start_video_session(request: StartSessionRequest):
         video_path = _save_video_from_request(request)
 
         # Start session with SAM3
-        session_id, video_info = server.video_model.start_session(
+        session_id, video_info = req.app.state.video_model.start_session(
             video_path=video_path, session_id=request.session_id
         )
 
         # Register session in manager
-        server.session_manager.create_session(
+        req.app.state.session_manager.create_session(
             session_id=session_id, session_type="video", video_info=video_info
         )
 
@@ -121,23 +146,23 @@ async def start_video_session(request: StartSessionRequest):
 
 
 @router.post("/session/{session_id}/prompt", response_model=AddPromptResponse)
-async def add_prompt_to_frame(session_id: str, request: AddPromptRequest):
+async def add_prompt_to_frame(session_id: str, request: AddPromptRequest, req: Request):
     """
     Add prompts to a specific frame in the video.
 
     This initializes or refines object tracking for a particular frame.
     The prompts will be used as reference for propagation.
     """
-    if server.video_model is None:
+    if req.app.state.video_model is None:
         raise HTTPException(status_code=503, detail="Video inference not enabled")
 
     # Check session exists
-    session = server.session_manager.get_session(session_id)
+    session = req.app.state.session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
     try:
-        server.session_manager.update_session_status(
+        req.app.state.session_manager.update_session_status(
             session_id, VideoSessionStatus.PROCESSING
         )
 
@@ -154,7 +179,8 @@ async def add_prompt_to_frame(session_id: str, request: AddPromptRequest):
         point_labels = [p.label for p in point_prompts] if point_prompts else None
 
         # Add prompt to SAM3
-        frame_idx, obj_id, masks, boxes_out, scores = server.video_model.add_prompt(
+        logger.info(f"Frame index is  {request.frame_index}...")
+        frame_idx, obj_ids, masks, boxes_out, scores = req.app.state.video_model.add_prompt(
             session_id=session_id,
             frame_index=request.frame_index,
             text_prompt=text_prompt,
@@ -166,24 +192,24 @@ async def add_prompt_to_frame(session_id: str, request: AddPromptRequest):
         )
 
         # Update session stats
-        session_info = server.video_model.get_session_info(session_id)
-        server.session_manager.update_session_stats(
+        session_info = req.app.state.video_model.get_session_info(session_id)
+        req.app.state.session_manager.update_session_stats(
             session_id, objects_count=session_info["num_objects"]
         )
-        server.session_manager.update_session_status(
+        req.app.state.session_manager.update_session_status(
             session_id, VideoSessionStatus.READY
         )
 
         return AddPromptResponse(
             frame_index=frame_idx,
-            obj_id=obj_id,
+            obj_id=obj_ids,
             masks=masks,
             boxes=boxes_out,
             scores=scores,
         )
 
     except Exception as e:
-        server.session_manager.update_session_status(
+        req.app.state.session_manager.update_session_status(
             session_id, VideoSessionStatus.ERROR, error=str(e)
         )
         logger.error(f"Failed to add prompt: {e}")
@@ -191,17 +217,17 @@ async def add_prompt_to_frame(session_id: str, request: AddPromptRequest):
 
 
 @router.post("/session/{session_id}/propagate", response_model=PropagateResponse)
-async def propagate_tracking(session_id: str, request: PropagateRequest):
+async def propagate_tracking(session_id: str, request: PropagateRequest, req: Request):
     """
     Propagate object tracking through video frames (non-streaming).
 
     Use this endpoint for batch processing. For real-time streaming,
     use the WebSocket endpoint at /ws/propagate/{session_id}.
     """
-    if server.video_model is None:
+    if req.app.state.video_model is None:
         raise HTTPException(status_code=503, detail="Video inference not enabled")
 
-    session = server.session_manager.get_session(session_id)
+    session = req.app.state.session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
@@ -214,7 +240,7 @@ async def propagate_tracking(session_id: str, request: PropagateRequest):
         )
 
     try:
-        server.session_manager.update_session_status(
+        req.app.state.session_manager.update_session_status(
             session_id, VideoSessionStatus.PROCESSING
         )
 
@@ -222,7 +248,7 @@ async def propagate_tracking(session_id: str, request: PropagateRequest):
         results: Dict[int, FrameResult] = {}
 
         # Propagate through video
-        for frame_data in server.video_model.propagate_in_video(
+        for frame_data in req.app.state.video_model.propagate_in_video(
             session_id=session_id,
             direction=request.direction,
             start_frame_index=request.start_frame_index,
@@ -236,10 +262,10 @@ async def propagate_tracking(session_id: str, request: PropagateRequest):
         elapsed_ms = (time.time() - start_time) * 1000
 
         # Update session stats
-        server.session_manager.update_session_stats(
+        req.app.state.session_manager.update_session_stats(
             session_id, frames_processed=len(results)
         )
-        server.session_manager.update_session_status(
+        req.app.state.session_manager.update_session_status(
             session_id, VideoSessionStatus.READY
         )
 
@@ -251,7 +277,7 @@ async def propagate_tracking(session_id: str, request: PropagateRequest):
         )
 
     except Exception as e:
-        server.session_manager.update_session_status(
+        req.app.state.session_manager.update_session_status(
             session_id, VideoSessionStatus.ERROR, error=str(e)
         )
         logger.error(f"Propagation failed: {e}")
@@ -267,7 +293,10 @@ async def propagate_tracking_stream(websocket: WebSocket, session_id: str):
     """
     await websocket.accept()
 
-    if server.video_model is None:
+    # Access app state via websocket scope for WebSocket connections
+    app_state = websocket.scope["app"].state
+    
+    if app_state.video_model is None:
         await websocket.send_json(
             StreamFrameMessage(
                 type="error", error="Video inference not enabled"
@@ -276,7 +305,7 @@ async def propagate_tracking_stream(websocket: WebSocket, session_id: str):
         await websocket.close()
         return
 
-    session = server.session_manager.get_session(session_id)
+    session = app_state.session_manager.get_session(session_id)
     if not session:
         await websocket.send_json(
             StreamFrameMessage(
@@ -293,14 +322,14 @@ async def propagate_tracking_stream(websocket: WebSocket, session_id: str):
         start_frame_index = request_data.get("start_frame_index", None)
         max_frames = request_data.get("max_frames", None)
 
-        server.session_manager.update_session_status(
+        app_state.session_manager.update_session_status(
             session_id, VideoSessionStatus.PROCESSING
         )
 
         frames_sent = 0
 
         # Stream frame results
-        for frame_data in server.video_model.propagate_in_video(
+        for frame_data in app_state.video_model.propagate_in_video(
             session_id=session_id,
             direction=direction,
             start_frame_index=start_frame_index,
@@ -319,10 +348,10 @@ async def propagate_tracking_stream(websocket: WebSocket, session_id: str):
             StreamFrameMessage(type="complete", total_frames=frames_sent).model_dump()
         )
 
-        server.session_manager.update_session_stats(
+        app_state.session_manager.update_session_stats(
             session_id, frames_processed=frames_sent
         )
-        server.session_manager.update_session_status(
+        app_state.session_manager.update_session_status(
             session_id, VideoSessionStatus.READY
         )
 
@@ -336,7 +365,7 @@ async def propagate_tracking_stream(websocket: WebSocket, session_id: str):
             )
         except:
             pass
-        server.session_manager.update_session_status(
+        app_state.session_manager.update_session_status(
             session_id, VideoSessionStatus.ERROR, error=str(e)
         )
     finally:
@@ -344,17 +373,17 @@ async def propagate_tracking_stream(websocket: WebSocket, session_id: str):
 
 
 @router.get("/session/{session_id}/status", response_model=SessionStatusResponse)
-async def get_session_status(session_id: str):
+async def get_session_status(session_id: str, req: Request):
     """Get current status of a video session."""
-    if server.video_model is None:
+    if req.app.state.video_model is None:
         raise HTTPException(status_code=503, detail="Video inference not enabled")
 
-    session = server.session_manager.get_session(session_id)
+    session = req.app.state.session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
     try:
-        session_info = server.video_model.get_session_info(session_id)
+        session_info = req.app.state.video_model.get_session_info(session_id)
 
         return SessionStatusResponse(
             session_id=session_id,
@@ -370,21 +399,21 @@ async def get_session_status(session_id: str):
 
 
 @router.delete("/session/{session_id}/object/{obj_id}", response_model=RemoveObjectResponse)
-async def remove_object_from_tracking(session_id: str, obj_id: int):
+async def remove_object_from_tracking(session_id: str, obj_id: int, req: Request):
     """Remove an object from tracking in the session."""
-    if server.video_model is None:
+    if req.app.state.video_model is None:
         raise HTTPException(status_code=503, detail="Video inference not enabled")
 
-    session = server.session_manager.get_session(session_id)
+    session = req.app.state.session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
     try:
-        server.video_model.remove_object(session_id, obj_id)
+        req.app.state.video_model.remove_object(session_id, obj_id)
 
         # Update stats
-        session_info = server.video_model.get_session_info(session_id)
-        server.session_manager.update_session_stats(
+        session_info = req.app.state.video_model.get_session_info(session_id)
+        req.app.state.session_manager.update_session_stats(
             session_id, objects_count=session_info["num_objects"]
         )
 
@@ -396,24 +425,24 @@ async def remove_object_from_tracking(session_id: str, obj_id: int):
 
 
 @router.post("/session/{session_id}/reset", response_model=ResetSessionResponse)
-async def reset_video_session(session_id: str):
+async def reset_video_session(session_id: str, req: Request):
     """Reset session to initial state (clears all prompts and objects)."""
-    if server.video_model is None:
+    if req.app.state.video_model is None:
         raise HTTPException(status_code=503, detail="Video inference not enabled")
 
-    session = server.session_manager.get_session(session_id)
+    session = req.app.state.session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
     try:
-        server.video_model.reset_session(session_id)
+        req.app.state.video_model.reset_session(session_id)
 
         # Clear stats
         objects_cleared = session["objects_count"]
-        server.session_manager.update_session_stats(
+        req.app.state.session_manager.update_session_stats(
             session_id, objects_count=0, frames_processed=0
         )
-        server.session_manager.update_session_status(
+        req.app.state.session_manager.update_session_status(
             session_id, VideoSessionStatus.READY
         )
 
@@ -427,25 +456,25 @@ async def reset_video_session(session_id: str):
 
 
 @router.delete("/session/{session_id}", response_model=CloseSessionResponse)
-async def close_video_session(session_id: str):
+async def close_video_session(session_id: str, req: Request):
     """Close and cleanup video session."""
-    if server.video_model is None:
+    if req.app.state.video_model is None:
         raise HTTPException(status_code=503, detail="Video inference not enabled")
 
-    session = server.session_manager.get_session(session_id)
+    session = req.app.state.session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
     try:
         # Get memory before closing
-        session_info = server.video_model.get_session_info(session_id)
+        session_info = req.app.state.video_model.get_session_info(session_id)
         memory_mb = session_info["gpu_memory_mb"]
 
         # Close SAM3 session
-        server.video_model.close_session(session_id)
+        req.app.state.video_model.close_session(session_id)
 
         # Remove from manager
-        server.session_manager.delete_session(session_id)
+        req.app.state.session_manager.delete_session(session_id)
 
         return CloseSessionResponse(
             session_id=session_id, memory_freed_mb=memory_mb
@@ -457,11 +486,11 @@ async def close_video_session(session_id: str):
 
 
 @router.get("/sessions", response_model=SessionListResponse)
-async def list_video_sessions():
+async def list_video_sessions(req: Request):
     """List all active video sessions."""
-    if server.video_model is None:
+    if req.app.state.video_model is None:
         raise HTTPException(status_code=503, detail="Video inference not enabled")
 
-    sessions = server.session_manager.list_sessions()
+    sessions = req.app.state.session_manager.list_sessions()
 
     return SessionListResponse(sessions=sessions, total_sessions=len(sessions))

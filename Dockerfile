@@ -1,20 +1,29 @@
-# SAM3 Inference Server Dockerfile
 FROM nvidia/cuda:12.6.0-cudnn-devel-ubuntu22.04
 
-# Set working directory
 WORKDIR /app
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
-    python3.12 \
-    python3-pip \
+    software-properties-common \
     git \
+    apt-utils \
     wget \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y \
+        python3.12 \
+        python3.12-venv \
+        python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 # Clone SAM3 repository
 RUN git clone https://github.com/facebookresearch/sam3.git /app/sam3
 
+RUN pip3 install --upgrade pip setuptools wheel
 # Install SAM3
 RUN cd /app/sam3 && pip3 install -e .
 
@@ -45,4 +54,3 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
   CMD python3 -c "import requests; requests.get('http://localhost:8000/health')"
 
 # Start server
-CMD ["python3", "server.py"]

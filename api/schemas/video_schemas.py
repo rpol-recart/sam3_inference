@@ -80,7 +80,7 @@ class AddPromptResponse(BaseModel):
     """Response for adding prompt."""
 
     frame_index: int
-    obj_id: int
+    obj_id: List[int]
     masks: List[str]
     boxes: List[List[float]]
     scores: List[float]

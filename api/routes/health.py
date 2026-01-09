@@ -1,7 +1,7 @@
 """Health check and monitoring endpoints."""
 import psutil
 import torch
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 from config import settings
@@ -48,19 +48,19 @@ async def health_check():
 
 
 @router.get("/models/info", response_model=ModelsInfoResponse)
-async def models_info():
+async def models_info(req: Request):
     """Get information about loaded models."""
-    import server
+    # Removed import server, using req.app.state instead
 
     image_info = ModelInfo(
-        loaded=server.image_model is not None,
+        loaded=req.app.state.image_model is not None,
         checkpoint=settings.sam3_checkpoint,
         device=settings.image_model_device,
         memory_mb=0.0,  # TODO: calculate actual memory
         capabilities=["text_prompt", "box_prompt", "batch_processing", "feature_caching"],
     )
 
-    if server.image_model and torch.cuda.is_available():
+    if req.app.state.image_model and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
         memory_bytes = torch.cuda.memory_allocated(device=settings.image_model_device)
         image_info.memory_mb = memory_bytes / (1024 * 1024)

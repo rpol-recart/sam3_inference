@@ -4,7 +4,7 @@ import hashlib
 import time
 from io import BytesIO
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from loguru import logger
 from PIL import Image
 
@@ -31,14 +31,14 @@ def decode_base64_image(base64_str: str) -> Image.Image:
 
 
 @router.post("/segment", response_model=ImageSegmentResponse)
-async def segment_image(request: ImageSegmentRequest):
+async def segment_image(request: ImageSegmentRequest, req: Request):
     """Segment image with prompts.
 
     Supports text prompts, box prompts, and combinations.
     """
-    import server
+    # Removed import server, using req.app.state instead
 
-    if server.image_model is None:
+    if req.app.state.image_model is None:
         raise HTTPException(status_code=503, detail="Image model not loaded")
 
     start_time = time.time()
@@ -51,24 +51,28 @@ async def segment_image(request: ImageSegmentRequest):
         # Extract prompts by type
         text_prompts = []
         box_prompts = []
+        point_prompts = []
 
         for prompt in request.prompts:
             if prompt.type == PromptType.TEXT:
                 text_prompts.append(prompt.text)
             elif prompt.type == PromptType.BOX:
                 box_prompts.append((prompt.box, prompt.label))
+            elif prompt.type == PromptType.POINT:
+                point_prompts.append((prompt.points, prompt.point_labels))
 
         # Segment with combined prompts
-        if text_prompts or box_prompts:
-            masks, boxes, scores = server.image_model.segment_combined(
+        if text_prompts or box_prompts or point_prompts:
+            masks, boxes, scores = req.app.state.image_model.segment_combined(
                 image=image,
                 text_prompts=text_prompts if text_prompts else None,
                 boxes=box_prompts if box_prompts else None,
+                points=point_prompts if point_prompts else None,
             )
         else:
             raise HTTPException(
                 status_code=400,
-                detail="At least one text or box prompt is required",
+                detail="At least one text, box, or point prompt is required",
             )
 
         inference_time = (time.time() - start_time) * 1000
@@ -95,15 +99,15 @@ async def segment_image(request: ImageSegmentRequest):
 
 
 @router.post("/cached-features", response_model=CachedFeaturesResponse)
-async def segment_with_cached_features(request: CachedFeaturesRequest):
+async def segment_with_cached_features(request: CachedFeaturesRequest, req: Request):
     """Segment image with multiple text prompts using feature caching.
 
     This endpoint caches the image features and applies multiple text prompts,
     which is ~10x faster than making separate requests for each prompt.
     """
-    import server
+    # Removed import server, using req.app.state instead
 
-    if server.image_model is None:
+    if req.app.state.image_model is None:
         raise HTTPException(status_code=503, detail="Image model not loaded")
 
     start_time = time.time()
@@ -118,12 +122,12 @@ async def segment_with_cached_features(request: CachedFeaturesRequest):
         cache_key = hashlib.md5(image_bytes.getvalue()).hexdigest()
 
         # Cache features if not already cached
-        cache_hit = cache_key in server.image_model.feature_cache
+        cache_hit = cache_key in req.app.state.image_model.feature_cache
         if not cache_hit:
-            server.image_model.cache_features(image, cache_key)
+            req.app.state.image_model.cache_features(image, cache_key)
 
         # Segment with all text prompts
-        results_list = server.image_model.segment_with_cached_features(
+        results_list = req.app.state.image_model.segment_with_cached_features(
             cache_key, request.text_prompts
         )
 

@@ -23,7 +23,7 @@ class SAM3ImageModel:
 
     def __init__(
         self,
-        checkpoint: str = "facebook/sam3",
+        checkpoint: Optional[str] = None,
         bpe_path: Optional[str] = None,
         device: str = "cuda:0",
         confidence_threshold: float = 0.5,
@@ -33,7 +33,7 @@ class SAM3ImageModel:
         """Initialize SAM3 image model.
 
         Args:
-            checkpoint: Model checkpoint path or HuggingFace ID
+            checkpoint: Model checkpoint path or HuggingFace ID. If None, defaults to local path or HF download.
             bpe_path: Path to BPE tokenizer file
             device: Device to load model on
             confidence_threshold: Confidence threshold for filtering
@@ -50,15 +50,55 @@ class SAM3ImageModel:
         if bpe_path is None:
             bpe_path = str(SAM3_ROOT / "sam3/assets/bpe_simple_vocab_16e6.txt.gz")
 
+        # Determine if we should load from HuggingFace or local path
+        load_from_HF = False
+        resolved_checkpoint_path = None
+        
+        # Check if checkpoint is a HuggingFace ID by looking for common patterns
+        # HuggingFace IDs typically contain "/" and don't look like file paths
+        if checkpoint is None:
+            # Default to local checkpoint if available, otherwise try HF
+            local_checkpoint = "/app/server/sam_weights/sam3.pt"
+            if Path(local_checkpoint).exists():
+                resolved_checkpoint_path = local_checkpoint
+            else:
+                load_from_HF = True
+        elif "/" in checkpoint and not checkpoint.startswith("/") and not Path(checkpoint).is_file():
+            # Likely a HuggingFace ID (e.g., "facebook/sam3")
+            if checkpoint == "facebook/sam3":
+                load_from_HF = True
+            else:
+                # Custom HuggingFace repo - this case should be handled by the download function
+                resolved_checkpoint_path = checkpoint
+        else:
+            # Local path - check if it's a directory or file
+            checkpoint_path = Path(checkpoint)
+            if checkpoint_path.is_dir():
+                # If it's a directory, look for sam3.pt inside
+                checkpoint_file = checkpoint_path / "sam3.pt"
+                if checkpoint_file.exists():
+                    resolved_checkpoint_path = str(checkpoint_file)
+                else:
+                    raise FileNotFoundError(f"Checkpoint file 'sam3.pt' not found in directory: {checkpoint}")
+            elif checkpoint_path.is_file():
+                # If it's already a file, use it directly
+                resolved_checkpoint_path = checkpoint
+            else:
+                # Path doesn't exist, check if it looks like a HF ID
+                load_from_HF = True
+
+        logger.info(f"Using checkpoint path: {resolved_checkpoint_path}, load_from_HF: {load_from_HF}")
+
         # Build model
         model = build_sam3_image_model(
-            checkpoint_path=checkpoint if checkpoint != "facebook/sam3" else None,
+            checkpoint_path=resolved_checkpoint_path,
             bpe_path=bpe_path,
             device=device,
             eval_mode=True,
-            load_from_HF=checkpoint == "facebook/sam3",
+            load_from_HF=load_from_HF,
             compile=compile,
         )
+        model = model.to(device)
 
         # Create processor
         self.processor = Sam3Processor(
@@ -67,10 +107,10 @@ class SAM3ImageModel:
             device=device,
             confidence_threshold=confidence_threshold,
         )
-
+ 
         # Feature cache for multiple prompts on same image
         self.feature_cache: Dict[str, Dict] = {}
-
+ 
         logger.info("SAM3 image model loaded successfully")
 
     def segment_text(
@@ -94,7 +134,7 @@ class SAM3ImageModel:
         state = self.processor.set_image(image)
 
         # Add text prompt
-        state = self.processor.set_text_prompt(state, prompt=text_prompt)
+        state = self.processor.set_text_prompt(prompt=text_prompt, state=state)
 
         # Extract results
         masks, boxes, scores = self._extract_results(state, image.size)
@@ -134,7 +174,7 @@ class SAM3ImageModel:
         ]
 
         state = self.processor.add_geometric_prompt(
-            state=state, bounding_box=box_pixels, bounding_box_label=label
+            box=box_pixels, label=label, state=state
         )
 
         # Extract results
@@ -151,6 +191,7 @@ class SAM3ImageModel:
         image: Image.Image,
         text_prompts: Optional[List[str]] = None,
         boxes: Optional[List[Tuple[List[float], bool]]] = None,
+        points: Optional[List[Tuple[List[List[float]], List[bool]]]] = None,
     ) -> Tuple[List[str], List[List[float]], List[float]]:
         """Segment with combined prompts.
 
@@ -158,6 +199,7 @@ class SAM3ImageModel:
             image: PIL Image
             text_prompts: List of text prompts
             boxes: List of (box, label) tuples
+            points: List of (points, labels) tuples where points is a list of [x, y] coordinates
 
         Returns:
             Tuple of (masks, boxes, scores)
@@ -167,7 +209,7 @@ class SAM3ImageModel:
         # Add text prompts
         if text_prompts:
             for text in text_prompts:
-                state = self.processor.set_text_prompt(state, prompt=text)
+                state = self.processor.set_text_prompt(prompt=text, state=state)
 
         # Add box prompts
         if boxes:
@@ -180,8 +222,39 @@ class SAM3ImageModel:
                     box[3] * orig_h,
                 ]
                 state = self.processor.add_geometric_prompt(
-                    state=state, bounding_box=box_pixels, bounding_box_label=label
+                    box=box_pixels, label=label, state=state
                 )
+
+        # Add point prompts - if supported by the processor
+        if points:
+            orig_w, orig_h = image.size
+            for point_list, point_labels in points:
+                # Convert normalized points to pixel coordinates
+                points_pixels = torch.tensor([[x * orig_w, y * orig_h] for x, y in point_list],
+                                           device=self.device, dtype=torch.float32).view(-1, 1, 2)
+                
+                # Convert point labels to tensor (assuming 1 for positive, 0 for negative)
+                point_tensor_labels = torch.tensor([1 if label else 0 for label in point_labels],
+                                                  device=self.device, dtype=torch.long).view(-1, 1)
+                
+                # Check if language features exist, if not, initialize with "visual" prompt
+                if "language_features" not in state["backbone_out"]:
+                    # Add a visual text prompt to the backbone output to allow geometric-only prompting
+                    dummy_text_outputs = self.processor.model.backbone.forward_text(["visual"], device=self.device)
+                    state["backbone_out"].update(dummy_text_outputs)
+                
+                # Initialize geometric prompt if not present
+                if "geometric_prompt" not in state:
+                    state["geometric_prompt"] = self.processor.model._get_dummy_prompt()
+                
+                # Use the append_points method of the geometric prompt
+                state["geometric_prompt"].append_points(
+                    points=points_pixels,
+                    labels=point_tensor_labels
+                )
+                
+                # Run the grounding with the updated prompt
+                state = self.processor._forward_grounding(state)
 
         return self._extract_results(state, image.size)
 
@@ -221,11 +294,16 @@ class SAM3ImageModel:
         results = []
 
         for prompt in text_prompts:
-            # Create state with cached backbone
-            state = {"backbone_out": cached["backbone_out"]}
+            # Create state with cached backbone and image information
+            orig_w, orig_h = cached["image_size"]
+            state = {
+                "backbone_out": cached["backbone_out"],
+                "original_height": orig_h,
+                "original_width": orig_w,
+            }
 
             # Add text prompt
-            state = self.processor.set_text_prompt(state, prompt=prompt)
+            state = self.processor.set_text_prompt(prompt=prompt, state=state)
 
             # Extract results
             masks, boxes, scores = self._extract_results(state, cached["image_size"])
@@ -267,17 +345,17 @@ class SAM3ImageModel:
                 state["boxes"][:, 3] / orig_h,
             ],
             dim=-1,
-        )
+        ).to(self.device)
 
         # Convert to XYWH format
-        boxes_xywh = box_xyxy_to_xywh(boxes_xyxy).tolist()
+        boxes_xywh = box_xyxy_to_xywh(boxes_xyxy).to(self.device).tolist()
 
         # RLE encode masks
-        masks_rle = rle_encode(state["masks"].squeeze(1))
+        masks_rle = rle_encode(state["masks"].squeeze(1).to(self.device))
         masks = [m["counts"] for m in masks_rle]
 
         # Scores
-        scores = state["scores"].tolist()
+        scores = state["scores"].to(self.device).tolist()
 
         # Filter by confidence threshold
         filtered_results = []
